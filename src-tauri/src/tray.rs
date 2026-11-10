@@ -42,8 +42,9 @@ pub fn handle_tray_event(app: &AppHandle, event: SystemTrayEvent) {
 
 /// Swap the tray icon between disconnected/connecting/connected states so
 /// the icon itself communicates status at a glance, per the spec.
-pub fn set_tray_status(app: &AppHandle, status: &str) {
-    let icon_path = match status {
+pub fn set_tray_status(_app: &AppHandle, _status: &str) {
+    // TODO: Add tray icon status switching later.
+}
         "connected" => "icons/tray-connected.png",
         "connecting" => "icons/tray-connecting.png",
         _ => "icons/tray-disconnected.png",
