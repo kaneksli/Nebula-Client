@@ -52,4 +52,4 @@ pub fn set_tray_status(app: &AppHandle, status: &str) {
     let _ = tray.set_icon(tauri::Icon::Raw(bytes));
 }
     }
-}
+
