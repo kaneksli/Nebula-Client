@@ -49,6 +49,6 @@ pub fn set_tray_status(app: &AppHandle, status: &str) {
         _ => "icons/tray-disconnected.png",
     };
     if let Some(tray) = app.tray_handle_by_id("main") {
-        let _ = tray.set_icon(tauri::Icon::File(std::path::PathBuf::from(icon_path)));
+        let _ = tray.set_icon(tauri::Icon::Raw(bytes));
     }
 }
