@@ -1,10 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod core_manager;
+mod elevate;
+mod geo;
 mod singbox;
+mod store;
+mod subscription;
 mod tray;
 
 use core_manager::{CoreManager, LiveStats, RunMode, ServerConfig};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use singbox::SingBoxCore;
 use std::sync::Arc;
@@ -15,6 +20,7 @@ pub struct SubscriptionDto {
     pub id: String,
     pub name: String,
     pub url: String,
+    pub collapsed: bool,
     pub servers: Vec<ServerDto>,
 }
 
@@ -27,6 +33,9 @@ pub struct ServerDto {
     pub ping: u32,
     pub lat: f64,
     pub lng: f64,
+    pub address: String,
+    pub port: u16,
+    pub raw_outbound: serde_json::Value,
 }
 
 /// Shared app state handed to every Tauri command. `core` is behind a
@@ -34,10 +43,9 @@ pub struct ServerDto {
 /// change here rather than a rewrite of the command layer.
 struct AppState {
     core: Arc<dyn CoreManager>,
-    // TODO: load/persist real subscriptions (SQLite or a flat JSON file
-    // under the app's config dir); this starts empty and the frontend
-    // falls back to its own mock data until that lands.
+    config_dir: std::path::PathBuf,
     subscriptions: tokio::sync::Mutex<Vec<SubscriptionDto>>,
+    settings: tokio::sync::Mutex<serde_json::Value>,
 }
 
 #[tauri::command]
@@ -47,23 +55,53 @@ async fn list_subscriptions(state: tauri::State<'_, AppState>) -> Result<Vec<Sub
 
 #[tauri::command]
 async fn add_subscription(state: tauri::State<'_, AppState>, url: String) -> Result<SubscriptionDto, String> {
-    // TODO: fetch `url`, parse the subscription payload (base64 list of
-    // vless://, vmess://, trojan://, hysteria2://, ss:// links or a
-    // sing-box/clash JSON) into ServerConfig entries, and persist them.
+    let links = subscription::fetch_links(&url).await.map_err(|e| e.to_string())?;
+    if links.is_empty() {
+        return Err("подписка не вернула ни одной валидной ссылки (vless/vmess/trojan/hysteria2/ss)".into());
+    }
+
+    let mut servers = Vec::new();
+    for link in &links {
+        match subscription::parse_link(link) {
+            Ok(mut parsed) => {
+                subscription::attach_coordinates(&mut parsed);
+                servers.push(ServerDto {
+                    id: parsed.id,
+                    country: parsed.country,
+                    flag: parsed.flag,
+                    protocol: parsed.protocol,
+                    ping: parsed.ping,
+                    lat: parsed.lat,
+                    lng: parsed.lng,
+                    address: parsed.address,
+                    port: parsed.port,
+                    raw_outbound: parsed.raw_outbound,
+                });
+            }
+            // a single bad link in a subscription shouldn't fail the whole import
+            Err(e) => eprintln!("skipping unparsable link: {e}"),
+        }
+    }
+
     let sub = SubscriptionDto {
-        id: uuid_v4(),
-        name: "Новая подписка".into(),
+        id: format!("sub-{}", uuid::Uuid::new_v4()),
+        name: format!("Подписка ({} серверов)", servers.len()),
         url,
-        servers: vec![],
+        collapsed: false,
+        servers,
     };
-    state.subscriptions.lock().await.push(sub.clone());
+
+    let mut subs = state.subscriptions.lock().await;
+    subs.push(sub.clone());
+    store::save_subscriptions(&state.config_dir, &subs).await.map_err(|e| e.to_string())?;
     Ok(sub)
 }
 
 #[tauri::command]
 async fn remove_subscription(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
-    state.subscriptions.lock().await.retain(|s| s.id != id);
-    Ok(())
+    let mut subs = state.subscriptions.lock().await;
+    subs.retain(|s| s.id != id);
+    store::save_subscriptions(&state.config_dir, &subs).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -106,13 +144,62 @@ async fn get_stats(state: tauri::State<'_, AppState>) -> Result<LiveStats, Strin
 }
 
 #[tauri::command]
-async fn ping_all(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    // TODO: fan out state.core.measure_ping() across every known server
-    // concurrently (tokio::join!/FuturesUnordered) and write the results
-    // back into `subscriptions`, then emit an event so the UI refreshes
-    // without a full re-fetch.
-    let _ = &state.core;
-    Ok(())
+async fn ping_all(state: tauri::State<'_, AppState>) -> Result<Vec<SubscriptionDto>, String> {
+    let mut subs = state.subscriptions.lock().await;
+
+    // measure every server concurrently instead of one at a time
+    let core = state.core.clone();
+    let configs: Vec<(usize, usize, ServerConfig)> = subs
+        .iter()
+        .enumerate()
+        .flat_map(|(si, sub)| {
+            sub.servers.iter().enumerate().map(move |(ri, srv)| {
+                (
+                    si,
+                    ri,
+                    ServerConfig {
+                        id: srv.id.clone(),
+                        protocol: srv.protocol.clone(),
+                        address: srv.address.clone(),
+                        port: srv.port,
+                        raw_outbound: srv.raw_outbound.clone(),
+                    },
+                )
+            })
+        })
+        .collect();
+
+    let measurements = join_all(configs.into_iter().map(|(si, ri, cfg)| {
+        let core = core.clone();
+        async move {
+            let ping = core.measure_ping(&cfg).await.unwrap_or(9999);
+            (si, ri, ping)
+        }
+    }))
+    .await;
+
+    for (si, ri, ping) in measurements {
+        if let Some(sub) = subs.get_mut(si) {
+            if let Some(srv) = sub.servers.get_mut(ri) {
+                srv.ping = ping;
+            }
+        }
+    }
+
+    store::save_subscriptions(&state.config_dir, &subs).await.map_err(|e| e.to_string())?;
+    Ok(subs.clone())
+}
+
+#[tauri::command]
+async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    Ok(state.settings.lock().await.clone())
+}
+
+#[tauri::command]
+async fn save_settings(state: tauri::State<'_, AppState>, settings: serde_json::Value) -> Result<(), String> {
+    let mut current = state.settings.lock().await;
+    *current = settings;
+    store::save_settings(&state.config_dir, &current).await.map_err(|e| e.to_string())
 }
 
 async fn find_server_config(state: &AppState, server_id: &str) -> Option<ServerConfig> {
@@ -121,29 +208,31 @@ async fn find_server_config(state: &AppState, server_id: &str) -> Option<ServerC
     Some(ServerConfig {
         id: dto.id.clone(),
         protocol: dto.protocol.clone(),
-        address: String::new(), // filled in once real subscription parsing lands
-        port: 0,
-        raw_outbound: serde_json::json!({}),
+        address: dto.address.clone(),
+        port: dto.port,
+        raw_outbound: dto.raw_outbound.clone(),
     })
-}
-
-fn uuid_v4() -> String {
-    // lightweight placeholder to avoid pulling in the `uuid` crate for a
-    // scaffold; swap for `uuid::Uuid::new_v4()` in the real build.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    format!("sub-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
 }
 
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let app_dir = app.path_resolver().app_config_dir().unwrap_or_default();
-            let binary_path = app_dir.join("bin").join(if cfg!(windows) { "sing-box.exe" } else { "sing-box" });
-            let core: Arc<dyn CoreManager> = Arc::new(SingBoxCore::new(binary_path, app_dir.join("singbox")));
+            let config_dir = app.path_resolver().app_config_dir().unwrap_or_default();
+            let binary_path = config_dir
+                .join("bin")
+                .join(if cfg!(windows) { "sing-box.exe" } else { "sing-box" });
+            let core: Arc<dyn CoreManager> = Arc::new(SingBoxCore::new(binary_path, config_dir.join("singbox")));
+
+            // block_on is fine here: setup() runs once, before the event
+            // loop, and these reads are tiny local JSON files.
+            let subs = tauri::async_runtime::block_on(store::load_subscriptions(&config_dir));
+            let settings = tauri::async_runtime::block_on(store::load_settings(&config_dir));
 
             app.manage(AppState {
                 core,
-                subscriptions: tokio::sync::Mutex::new(vec![]),
+                config_dir,
+                subscriptions: tokio::sync::Mutex::new(subs),
+                settings: tokio::sync::Mutex::new(settings),
             });
             Ok(())
         })
@@ -157,6 +246,8 @@ fn main() {
             disconnect,
             get_stats,
             ping_all,
+            get_settings,
+            save_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nebula VPN");

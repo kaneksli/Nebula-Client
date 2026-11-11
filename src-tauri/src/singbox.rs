@@ -1,11 +1,12 @@
 use crate::core_manager::{CoreManager, LiveStats, RunMode, ServerConfig};
+use crate::elevate;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 
 const CLASH_API_BASE: &str = "http://127.0.0.1:9090";
@@ -89,19 +90,15 @@ impl CoreManager for SingBoxCore {
         tokio::fs::create_dir_all(&self.config_dir).await?;
         tokio::fs::write(self.config_path(), serde_json::to_vec_pretty(&config)?).await?;
 
-        // NOTE: TUN mode requires elevated privileges on every platform
-        // (root/sudo on Linux/macOS, admin + WinTun driver on Windows).
-        // In the packaged app this should go through a privileged helper
-        // process registered at install time rather than prompting per
-        // connection; wiring that helper is left for the platform-specific
-        // installer scripts.
-        let child = Command::new(&self.binary_path)
-            .arg("run")
-            .arg("-c")
-            .arg(self.config_path())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("failed to spawn {:?}", self.binary_path))?;
+        // TUN mode needs root/admin on every platform (WinTun driver must
+        // also be installed on Windows for the tun inbound to come up at
+        // all); Proxy mode only opens local HTTP/SOCKS listeners and never
+        // elevates. See elevate.rs for exactly how each OS is handled, and
+        // its own caveats about what could not be exercised from here.
+        let elevated = matches!(mode, RunMode::Tun);
+        let args = vec!["run".to_string(), "-c".to_string(), self.config_path().display().to_string()];
+        let child = elevate::spawn(&self.binary_path, &args, elevated)
+            .with_context(|| format!("failed to spawn {:?} (elevated: {elevated})", self.binary_path))?;
 
         *self.child.lock().await = Some(child);
         self.connected.store(true, Ordering::SeqCst);
